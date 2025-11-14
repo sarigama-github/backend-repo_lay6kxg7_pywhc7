@@ -1,8 +1,13 @@
 import os
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from typing import List, Optional, Any
+from bson import ObjectId
 
-app = FastAPI()
+from database import create_document, get_documents, db
+
+app = FastAPI(title="Architecture Portfolio API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -12,17 +17,61 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/")
+
+# --------- Helpers ---------
+class PyObjectId(ObjectId):
+    @classmethod
+    def __get_validators__(cls):
+        yield cls.validate
+
+    @classmethod
+    def validate(cls, v):
+        if not ObjectId.is_valid(v):
+            raise ValueError("Invalid ObjectId")
+        return ObjectId(v)
+
+
+def serialize_doc(doc: dict) -> dict:
+    if not doc:
+        return doc
+    d = dict(doc)
+    if d.get("_id") is not None:
+        d["id"] = str(d.pop("_id"))
+    # Convert any ObjectIds inside arrays
+    for k, v in d.items():
+        if isinstance(v, ObjectId):
+            d[k] = str(v)
+        if isinstance(v, list):
+            d[k] = [str(x) if isinstance(x, ObjectId) else x for x in v]
+    return d
+
+
+# --------- Schemas (Pydantic) ---------
+class WorkBase(BaseModel):
+    title: str = Field(..., description="Project title")
+    description: Optional[str] = Field(None, description="Short description")
+    year: Optional[int] = Field(None, ge=1900, le=2100)
+    location: Optional[str] = None
+    cover_image: Optional[str] = None
+    gallery: Optional[List[str]] = Field(default_factory=list)
+
+
+class WorkCreate(WorkBase):
+    pass
+
+
+class WorkOut(WorkBase):
+    id: str
+
+
+# --------- Routes ---------
+@app.get("/", tags=["root"])
 def read_root():
-    return {"message": "Hello from FastAPI Backend!"}
+    return {"message": "Architecture Portfolio Backend is running"}
 
-@app.get("/api/hello")
-def hello():
-    return {"message": "Hello from the backend API!"}
 
-@app.get("/test")
+@app.get("/test", tags=["health"])
 def test_database():
-    """Test endpoint to check if database is available and accessible"""
     response = {
         "backend": "✅ Running",
         "database": "❌ Not Available",
@@ -31,38 +80,56 @@ def test_database():
         "connection_status": "Not Connected",
         "collections": []
     }
-    
+
     try:
-        # Try to import database module
-        from database import db
-        
         if db is not None:
             response["database"] = "✅ Available"
-            response["database_url"] = "✅ Configured"
-            response["database_name"] = db.name if hasattr(db, 'name') else "✅ Connected"
-            response["connection_status"] = "Connected"
-            
-            # Try to list collections to verify connectivity
+            response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
+            response["database_name"] = getattr(db, "name", None) or "❌ Unknown"
+            # Try list collections
             try:
                 collections = db.list_collection_names()
-                response["collections"] = collections[:10]  # Show first 10 collections
+                response["collections"] = collections[:10]
+                response["connection_status"] = "Connected"
                 response["database"] = "✅ Connected & Working"
             except Exception as e:
-                response["database"] = f"⚠️  Connected but Error: {str(e)[:50]}"
+                response["database"] = f"⚠️ Connected but error: {str(e)[:50]}"
         else:
-            response["database"] = "⚠️  Available but not initialized"
-            
-    except ImportError:
-        response["database"] = "❌ Database module not found (run enable-database first)"
+            response["database"] = "⚠️ Available but not initialized"
     except Exception as e:
         response["database"] = f"❌ Error: {str(e)[:50]}"
-    
-    # Check environment variables
-    import os
-    response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
-    response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
-    
+
     return response
+
+
+@app.post("/api/works", response_model=WorkOut, tags=["works"])
+def create_work(payload: WorkCreate):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    work_id = create_document("work", payload.model_dump())
+    # Fetch inserted document to return fully
+    inserted = db["work"].find_one({"_id": ObjectId(work_id)})
+    return serialize_doc(inserted)
+
+
+@app.get("/api/works", response_model=List[WorkOut], tags=["works"])
+def list_works(limit: Optional[int] = 100):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    docs = get_documents("work", {}, limit=limit)
+    return [serialize_doc(d) for d in docs]
+
+
+@app.get("/api/works/{work_id}", response_model=WorkOut, tags=["works"])
+def get_work(work_id: str):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    if not ObjectId.is_valid(work_id):
+        raise HTTPException(status_code=400, detail="Invalid id")
+    doc = db["work"].find_one({"_id": ObjectId(work_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Not found")
+    return serialize_doc(doc)
 
 
 if __name__ == "__main__":
